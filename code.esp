@@ -1,0 +1,233 @@
+/*Firebase_Buzzer*/
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <DHT11.h>
+
+#define DHT_PIN D5
+#define SOIL_MOISTURE_PIN A0
+#define RELAY_PIN D1 // Define the pin connected to the relay
+
+// oled
+#include <SSD1306.h>
+#define SDA_PIN D2
+#define SCL_PIN D3
+SSD1306 oled(0x3c, SDA_PIN, SCL_PIN);
+
+#define AP_SSID "HSU_Students"
+#define AP_PASSWORD "dhhs12cnvch"
+#define DB_URL "https://dmcuocdoi-a155f-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define DB_SECRET "MX0BdfPfMSp5pcIMTh8BvwWfzVywxoROUaIdT1ty"
+#define NTP_SERVER "pool.ntp.org"
+
+FirebaseConfig config;
+FirebaseAuth auth;
+FirebaseData fbdo;
+
+DHT11 dht11(DHT_PIN);
+
+unsigned long previousMillis = 0;
+const long interval = 3000; // 3 seconds
+
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+   // Ensure the relay is off initially
+  initOled();
+  initWifi();
+  initFirebase();
+}
+
+void loop() {
+  int value = getValueFromFirebase();
+  int temp = 0, humi = 0;
+  int soilMoisture = 0;
+  
+  readDHT11(temp, humi);
+  soilMoisture = readSoilMoisture();
+
+  Serial.print("Temperature: " + String(temp));
+  Serial.print(" Humidity: " + String(humi));
+  Serial.println(" Soil Moisture: " + String(soilMoisture));
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    printOled("Soil Moisture", ":"+ String(soilMoisture));
+    delay(3000);
+    printOled("Humidity", ":"+ String(humi));
+    delay(3000);
+    printOled("Temperature", ":"+ String(temp));
+    delay(3000);
+  }
+  
+  // Update Firebase with sensor data
+  updateFirebase(temp, humi, soilMoisture);
+
+  // Control the relay based on soil moisture levels and mode
+  controlRelay(soilMoisture);
+  
+  // Listen for changes in Firebase to toggle the relay
+  if (Firebase.ready()) {
+    Firebase.getString(fbdo, "/Relay/toggle");
+    if (fbdo.dataType() == "string") {
+      String toggleValue = fbdo.stringData();
+      if (toggleValue == "ON") {
+        digitalWrite(RELAY_PIN, HIGH); // Turn relay on
+      } else if (toggleValue == "OFF") {
+        digitalWrite(RELAY_PIN, LOW); // Turn relay off
+      }
+    }
+  }
+
+  delay(2000); // Add a delay to avoid flooding the Firebase with requests
+}
+
+/* DHT11 */
+void readDHT11(int& temp, int& humi) {
+  int temperature = dht11.readTemperature();
+  delay(10);
+  int humidity = dht11.readHumidity();
+  if (temperature != DHT11::ERROR_CHECKSUM && temperature != DHT11::ERROR_TIMEOUT &&
+      humidity != DHT11::ERROR_CHECKSUM && humidity != DHT11::ERROR_TIMEOUT) {
+    temp = temperature;
+    humi = humidity;
+  }
+}
+
+/* Soil Moisture */
+int readSoilMoisture() {
+  return analogRead(SOIL_MOISTURE_PIN);
+}
+
+/* Update Firebase */
+void updateFirebase(int temp, int humi, int soilMoisture) {
+  if (Firebase.ready()) {
+    if (Firebase.setInt(fbdo, "/DHT11/temperature", temp)) {
+      Serial.println("Temperature sent to Firebase");
+    } else {
+      Serial.println("Failed to send temperature to Firebase: " + fbdo.errorReason());
+    }
+    
+    if (Firebase.setInt(fbdo, "/DHT11/humidity", humi)) {
+      Serial.println("Humidity sent to Firebase");
+    } else {
+      Serial.println("Failed to send humidity to Firebase: " + fbdo.errorReason());
+    }
+    
+    if (Firebase.setInt(fbdo, "/SoilMoisture/value", soilMoisture)) {
+      Serial.println("Soil moisture sent to Firebase");
+    } else {
+      Serial.println("Failed to send soil moisture to Firebase: " + fbdo.errorReason());
+    }
+  }
+}
+
+/* Control Relay */void controlRelay(int soilMoisture) {
+  if (Firebase.ready()) {
+    Firebase.getString(fbdo, "/Relay/mode");
+    if (fbdo.dataType() == "string") {
+      String modeValue = fbdo.stringData();
+      if (modeValue == "AUTO") {
+        if (soilMoisture < 300) { // Threshold for soil moisture, adjust as needed
+          digitalWrite(RELAY_PIN, HIGH); // Turn relay on
+          Serial.println("Relay turned ON (AUTO mode)");
+          if (Firebase.ready()) {
+            if (Firebase.setString(fbdo, "/Relay/status", "ON")) {
+              Serial.println("Relay status sent to Firebase");
+            } else {
+              Serial.println("Failed to send relay status to Firebase: " + fbdo.errorReason());
+            }
+          }
+        } else {
+          digitalWrite(RELAY_PIN, LOW); // Turn relay off
+          Serial.println("Relay turned OFF (AUTO mode)");
+          if (Firebase.ready()) {
+            if (Firebase.setString(fbdo, "/Relay/status", "OFF")) {
+              Serial.println("Relay status sent to Firebase");
+            } else {
+              Serial.println("Failed to send relay status to Firebase: " + fbdo.errorReason());
+            }
+          }
+        }
+      } else if (modeValue == "MANUAL") {
+        // In manual mode, relay control will be handled by the toggle switch
+        Serial.println("Relay control is MANUAL mode");
+        Firebase.getString(fbdo, "/Relay/status");
+        if (fbdo.dataType() == "string") {
+        String toggleValue = fbdo.stringData();
+        if (toggleValue == "ON") {
+          digitalWrite(RELAY_PIN, HIGH); // Turn relay on
+          Serial.println("Relay turned ON (MANUAL mode)");
+        } else if (toggleValue == "OFF") {
+          digitalWrite(RELAY_PIN, LOW); // Turn relay off
+          Serial.println("Relay turned OFF (MANUAL mode)");
+        }
+      }
+      }
+    }
+  }
+}
+
+/* Wifi */
+void initWifi() {
+  blinkBuiltinLed(10);
+  Serial.print("\nConnecting to ");
+  Serial.print(AP_SSID);
+  WiFi.begin(AP_SSID, AP_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.print("\nWiFi connected, IP address: ");
+  Serial.println(WiFi.localIP());
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  blinkBuiltinLed(10);
+}
+
+void blinkBuiltinLed(int n) {
+  pinMode(BUILTIN_LED, OUTPUT);
+  for (int i = 1; i <= n; i++) {
+    digitalWrite(BUILTIN_LED, LOW);
+    delay(200);
+    digitalWrite(BUILTIN_LED, HIGH);
+    delay(200);
+  }
+}
+
+/* Firebase */
+void initFirebase() {
+  config.database_url = DB_URL;
+  config.signer.tokens.legacy_token = DB_SECRET;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectNetwork(true);
+}
+
+int getValueFromFirebase() {
+  int value = -1;
+  if (Firebase.ready()) {
+    if (Firebase.getInt(fbdo, "DHT11/value")) {
+      value = fbdo.intData();
+    }
+    Serial.println("value: " + String(value));
+  }
+  return value;
+}
+
+void initOled(){
+  oled.init();
+  oled.flipScreenVertically();
+}
+
+void printOled(String line1, String line2) {
+  oled.clear();
+  oled.setTextAlignment(TEXT_ALIGN_LEFT);
+  oled.setFont(ArialMT_Plain_24);
+  oled.drawString(0,0,line1);
+  oled.drawString(0,36,line2);
+  oled.display();
+}
